@@ -915,6 +915,10 @@ protected:
   /// DefinedNonLazyCategories - List of defined "non-lazy" categories.
   SmallVector<llvm::GlobalValue*, 16> DefinedNonLazyCategories;
 
+  /// ExpresscallChecks - List of boolean values indicating whether we should
+  /// attempt to expresscall.
+  llvm::StringMap<llvm::GlobalVariable *> ExpresscallChecks;
+
   /// Cached reference to the class for constant strings. This value has type
   /// int * but is actually an Obj-C class pointer.
   llvm::WeakTrackingVH ConstantStringClassRef;
@@ -1036,6 +1040,10 @@ protected:
                                       ObjCCommonTypesHelper &ObjCTypes);
 
   std::string GetSectionName(StringRef Section, StringRef MachOAttributes);
+
+  // EmitExpresscallCheck - Emit a check to see if we should expresscall.
+  llvm::Value *EmitExpresscallCheck(CodeGen::CodeGenFunction &CGF,
+                                    const std::string &name);
 
 public:
   /// CreateMetadataVar - Create a global variable with internal
@@ -2264,8 +2272,78 @@ CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
 
   llvm::CallBase *CallSite;
   CGCallee Callee = CGCallee::forDirect(BitcastFn);
-  RValue rvalue = CGF.EmitCall(MSI.CallInfo, Callee, Return, ActualArgs,
-                               &CallSite);
+
+  llvm::FunctionCallee PreresolvedFn = nullptr;
+
+  SmallString<256> Name;
+  if (!Method->isDirectMethod() && !Method->isClassMethod()) {
+    GetNameForMethod(Method, Method->getClassInterface(), Name);
+    PreresolvedFn = CGM.getModule().getFunction(Name);
+  }
+
+  auto NonNullBlock = CGF.createBasicBlock("msgSend.nonnull");
+  auto PreresolvedBlock = CGF.createBasicBlock("msgSend.preresolved");
+  auto UnresolvedBlock = CGF.createBasicBlock("msgSend.unresolved");
+  auto MergeBlock = CGF.createBasicBlock("msgSend.merge");
+  llvm::Value *PreresolvedValue = nullptr;
+
+  if (PreresolvedFn) {
+    auto BitcastPreresolvedFn = cast<llvm::Constant>(CGF.Builder.CreateBitCast(
+        PreresolvedFn.getCallee(), MSI.MessengerType));
+    auto PreresolvedCallee = CGCallee::forDirect(BitcastPreresolvedFn);
+
+    CGF.Builder.CreateCondBr(CGF.Builder.CreateIsNotNull(Arg0), NonNullBlock,
+                             UnresolvedBlock);
+
+    CGF.EmitBlock(NonNullBlock);
+    CGF.Builder.SetInsertPoint(NonNullBlock);
+    // Check if the pointer is tagged; i.e. its lower bit is set
+    auto IsUntagged = CGF.Builder.CreateNot(CGF.Builder.CreateIntCast(
+        CGF.Builder.CreateAnd(CGF.Builder.CreatePtrToInt(Arg0, CGM.IntPtrTy),
+                              llvm::ConstantInt::get(CGM.IntPtrTy, 1)),
+        CGF.Builder.getInt1Ty(), false));
+    auto ExpectedIsa = CGF.Builder.CreatePtrToInt(
+        GetClass(CGF, Method->getClassInterface()), CGM.IntPtrTy);
+    // Load the isa at runtime. The field is the first member of arg0 so cast it
+    // appropriately, load it, and mask it with ISA_MASK, 0x00007ffffffffff8ULL.
+    auto ActualIsa = CGF.Builder.CreateAnd(
+        CGF.Builder.CreatePtrToInt(
+            CGF.Builder.CreateLoad(Address(
+                CGF.Builder.CreateBitCast(
+                    Arg0, llvm::PointerType::getUnqual(ExpectedIsa->getType())),
+                CGM.getPointerAlign())),
+            CGM.IntPtrTy),
+        llvm::ConstantInt::get(CGM.IntPtrTy, 0x00007ffffffffff8ULL));
+    auto IsaMatch = CGF.Builder.CreateICmpEQ(ActualIsa, ExpectedIsa);
+    auto CanExpresscall = EmitExpresscallCheck(CGF, std::string(Name.c_str()));
+    CGF.Builder.CreateCondBr(
+        CGF.Builder.CreateAnd(CGF.Builder.CreateAnd(IsUntagged, IsaMatch),
+                              CanExpresscall),
+        PreresolvedBlock, UnresolvedBlock);
+
+    CGF.EmitBlock(PreresolvedBlock);
+    CGF.Builder.SetInsertPoint(PreresolvedBlock);
+    PreresolvedValue = CGF.EmitCall(MSI.CallInfo, PreresolvedCallee, Return,
+                                    ActualArgs, &CallSite)
+                           .getScalarVal();
+    CGF.EmitBranch(MergeBlock);
+  }
+
+  CGF.EmitBlock(UnresolvedBlock);
+  CGF.Builder.SetInsertPoint(UnresolvedBlock);
+  auto UnresolvedValue =
+      CGF.EmitCall(MSI.CallInfo, Callee, Return, ActualArgs, &CallSite)
+          .getScalarVal();
+  CGF.EmitBranch(MergeBlock);
+
+  CGF.EmitBlock(MergeBlock);
+  CGF.Builder.SetInsertPoint(MergeBlock);
+  auto phi = CGF.Builder.CreatePHI(UnresolvedValue->getType(), 2, "merged");
+  if (PreresolvedValue) {
+    phi->addIncoming(PreresolvedValue, PreresolvedBlock);
+  }
+  phi->addIncoming(UnresolvedValue, UnresolvedBlock);
+  auto rvalue = RValue::get(phi);
 
   // Mark the call as noreturn if the method is marked noreturn and the
   // receiver cannot be null.
@@ -4211,6 +4289,21 @@ CGObjCCommonMac::CreateCStringLiteral(StringRef Name, ObjCLabelType Type,
   CGM.addCompilerUsedGlobal(GV);
 
   return GV;
+}
+
+llvm::Value *
+CGObjCCommonMac::EmitExpresscallCheck(CodeGen::CodeGenFunction &CGF,
+                                      const std::string &Name) {
+  auto MangledName = "OBJC_EXPRESSCALL_" + Name;
+  std::transform(MangledName.begin(), MangledName.end(), MangledName.begin(),
+                 [](auto c) { return isalpha(c) ? c : '_'; });
+  auto Variable = CreateMetadataVar(MangledName, CGF.Builder.getFalse(),
+                                    "__DATA,__objc_exprscall,regular",
+                                    CharUnits::One(), true);
+  Variable->setLinkage(llvm::GlobalVariable::ExternalLinkage);
+  auto Entry = ExpresscallChecks.insert(std::make_pair(Name, Variable)).first;
+  return CGF.Builder.CreateNot(
+      CGF.Builder.CreateLoad(Address(Entry->second, CharUnits::One())));
 }
 
 llvm::Function *CGObjCMac::ModuleInitFunction() {
